@@ -1,612 +1,802 @@
 <?php
-// admin/dashboard.php (add inline "approve + redirect" per visitor strip)
-// PHP 7+
+// admin/dashboard.php
 declare(strict_types=1);
-
-// حمّل ووردبريس
-$wp_load_guess = __DIR__ . '/../wp-load.php';
-if (!file_exists($wp_load_guess)) {
-  // جرّب مسار بديل إن لزم (يمكنك تبديله لمسارك الصحيح)
-  $wp_load_guess = dirname(__DIR__) . '/wp-load.php';
-}
-require_once $wp_load_guess;
-
+require_once __DIR__ . '/../wp-load.php';
 global $wpdb;
 
-/* =====================[ Helpers ]===================== */
-if (session_status() !== PHP_SESSION_ACTIVE) session_start();
-function e($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
-function flash_set($key,$val){ $_SESSION['__flash'][$key]=$val; }
-function flash($key){ $v=$_SESSION['__flash'][$key]??null; unset($_SESSION['__flash'][$key]); return $v; }
-function csrf_token(){ if (empty($_SESSION['__csrf'])) $_SESSION['__csrf']=bin2hex(random_bytes(16)); return $_SESSION['__csrf']; }
-function check_csrf($t){ return isset($_SESSION['__csrf']) && hash_equals($_SESSION['__csrf'], (string)$t); }
+/**
+ * مصادر الإرسالات المدعومة:
+ * - wp_e_submissions + wp_e_submissions_values (Elementor)
+ * - {$wpdb->prefix}approvals (إن وُجد)
+ * - submissions / wp_submissions (إن وُجد)
+ *
+ * الإضافات الجديدة:
+ * - action=delete_visitor (POST): حذف كل إرسالات زائر محدّد من كل المصادر.
+ * - action=delete_all (POST): حذف كل الإرسالات من كل المصادر (تحذير).
+ * كلاهما محميّان بـ CSRF token داخل الجلسة.
+ */
 
-$table = $wpdb->prefix . 'approvals';
-$ADMIN_PASS = 'change-me'; // غيّرها فورًا
+session_start();
+$password = '12345'; // غيّرها فورًا
+function esc($v){ return htmlspecialchars((string)$v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 
-/* =====================[ Utilities ]===================== */
-function table_exists_wp(string $name): bool {
-  global $wpdb;
-  $sql = $wpdb->prepare("SHOW TABLES LIKE %s", $name);
-  return (bool)$wpdb->get_var($sql);
+// CSRF token
+if (empty($_SESSION['csrf'])) {
+    $_SESSION['csrf'] = bin2hex(random_bytes(16));
 }
-function ensure_online_table(): string {
-  global $wpdb;
-  $tbl = $wpdb->prefix . 'visitor_online';
-  if (!table_exists_wp($tbl)) {
-    $charset = $wpdb->get_charset_collate();
-    // إنشاء بسيط؛ لو لم تكن لديك صلاحية CREATE TABLE لن يتوقف التنفيذ
-    $wpdb->query("CREATE TABLE IF NOT EXISTS `{$tbl}` (
-      `visitor_id` varchar(128) NOT NULL,
-      `last_seen`  datetime NOT NULL,
-      `ip`         varchar(64) NULL,
-      `ua`         varchar(255) NULL,
-      PRIMARY KEY (`visitor_id`),
-      KEY `last_seen` (`last_seen`)
-    ) {$charset}");
-  }
-  return $tbl;
-}
-function is_visitor_online(string $visitor_id, int $thresholdSecs=120): bool {
-  global $wpdb;
-  if ($visitor_id==='') return false;
-  $tbl = ensure_online_table();
-  $since = gmdate('Y-m-d H:i:s', time()-$thresholdSecs);
-  $c = (int)$wpdb->get_var($wpdb->prepare(
-    "SELECT COUNT(*) FROM `{$tbl}` WHERE visitor_id=%s AND last_seen >= %s",
-    $visitor_id, $since
-  ));
-  return $c>0;
-}
-function host_path_from_url(string $url): string {
-  $p = @parse_url($url);
-  return ($p['host'] ?? '') . ($p['path'] ?? '');
-}
-function page_title_from_url(string $url): string {
-  $post_id = url_to_postid($url);
-  return $post_id ? (string)get_the_title($post_id) : '';
-}
-function get_submission_keys(int $submission_id, array $keys): array {
-  global $wpdb;
-  $tbl_vals = $wpdb->prefix . 'e_submissions_values';
-  if (!table_exists_wp($tbl_vals) || !$submission_id || !$keys) return [];
-  $in = implode(',', array_fill(0, count($keys), '%s'));
-  $rows = $wpdb->get_results($wpdb->prepare(
-    "SELECT `key`,`value` FROM {$tbl_vals} WHERE submission_id=%d AND `key` IN ($in)",
-    ...array_merge([$submission_id], $keys)
-  ), ARRAY_A);
-  $out = [];
-  foreach($rows as $r){ $out[$r['key']] = (string)$r['value']; }
-  return $out;
-}
-function infer_visitor_name_from_submission(int $submission_id): string {
-  $candidates = [
-    'name','your-name','fullname','full_name','full-name','الاسم','الإسم',
-    'first_name','first-name','firstName','الاسم_الاول','الاسم-الاول',
-    'last_name','last-name','lastName','اسم_العائلة','اسم-العائلة'
-  ];
-  $vals = get_submission_keys($submission_id, $candidates);
-  $first=''; $last='';
-  foreach(['name','your-name','fullname','full_name','full-name','الاسم','الإسم'] as $k){ if (!empty($vals[$k])) return trim($vals[$k]); }
-  foreach(['first_name','first-name','firstName','الاسم_الاول','الاسم-الاول'] as $k){ if (!empty($vals[$k])) { $first = trim($vals[$k]); break; } }
-  foreach(['last_name','last-name','lastName','اسم_العائلة','اسم-العائلة'] as $k){ if (!empty($vals[$k])) { $last = trim($vals[$k]); break; } }
-  return trim($first . ' ' . $last);
-}
-function fetch_submission_fields_via_context(array $approval_row, ?int $window_minutes = null): array {
-  global $wpdb;
-  $win_qs  = isset($_GET['win']) ? max(1, (int)$_GET['win']) : null;
-  $window  = $window_minutes !== null ? $window_minutes : ($win_qs ?: 15);
+$CSRF = $_SESSION['csrf'];
 
-  $tbl_sub  = $wpdb->prefix . 'e_submissions';
-  $tbl_vals = $wpdb->prefix . 'e_submissions_values';
-  if (!table_exists_wp($tbl_sub) || !table_exists_wp($tbl_vals)) return [];
+// شاشة الدخول
+if (!isset($_SESSION['logged_in'])) {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (isset($_POST['pass']) && hash_equals($password, (string)$_POST['pass'])) {
+            $_SESSION['logged_in'] = true;
+            header("Location: dashboard.php"); exit;
+        } else { $error = 'كلمة المرور غير صحيحة'; }
+    }
+    ?>
+    <!doctype html><html lang="ar" dir="rtl"><head>
+      <meta charset="utf-8"><title>تسجيل الدخول - لوحة التحكم</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <style>
+        body{font-family:system-ui,-apple-system,Segoe UI,Tahoma,Arial;background:#f5f6f7;margin:0;display:grid;place-items:center;min-height:100vh}
+        form{background:#fff;padding:24px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.08);width:min(92vw,360px)}
+        h2{margin:0 0 12px} input,button{font:inherit}
+        input{padding:10px 12px;width:100%;border:1px solid #e2e8f0;border-radius:10px}
+        button{padding:10px 14px;border:0;border-radius:10px;background:#0ea5e9;color:#fff;margin-top:12px;cursor:pointer}
+        .err{color:#dc2626;margin-top:8px}
+      </style>
+    </head><body>
+      <form method="post">
+        <h2>لوحة التحكم</h2>
+        <input type="password" name="pass" placeholder="كلمة المرور" required>
+        <button>دخول</button>
+        <?php if(!empty($error)) echo "<p class='err'>".esc($error)."</p>"; ?>
+      </form>
+    </body></html><?php
+    exit;
+}
 
-  $redir      = trim((string)($approval_row['redirect_url'] ?? ''));
-  $created_at = trim((string)($approval_row['created_at'] ?? ''));
-  $centerTs   = $created_at !== '' ? strtotime($created_at) : time();
-
-  $from = gmdate('Y-m-d H:i:s', $centerTs - ($window * 60));
-  $to   = gmdate('Y-m-d H:i:s', $centerTs);
-
-  $needle = $redir !== '' ? host_path_from_url($redir) : '';
-  $like   = $needle !== '' ? ('%' . $wpdb->esc_like($needle) . '%') : '';
-  $urlKeys = ['page_url','referrer','current_url','source_url'];
-  $inUrl   = implode(',', array_fill(0, count($urlKeys), '%s'));
-
-  $take_one = function(int $id) use ($tbl_vals): array {
+// ---------- أدوات عامّة ----------
+function table_exists(string $table): bool {
     global $wpdb;
-    $rows = $wpdb->get_results($wpdb->prepare("SELECT `key`,`value` FROM {$tbl_vals} WHERE submission_id=%d", $id), ARRAY_A);
-    $fields = [];
-    foreach ($rows as $r) {
-      $k = (string)$r['key']; $v = (string)$r['value'];
-      if (in_array($k, ['page_id','_wpnonce'], true)) continue;
-      $fields[$k] = isset($fields[$k]) ? ($fields[$k] . "\n" . $v) : $v;
+    $like = $wpdb->esc_like($table);
+    $t = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $like));
+    return $t !== null && $t !== '';
+}
+function get_columns(string $table): array { global $wpdb; return $wpdb->get_col("DESC `$table`", 0) ?: []; }
+function get_created_at(array $row): string {
+    foreach (['created_at','created_on','date_added','submitted_at','time','timestamp','date','created'] as $c) {
+        if (!empty($row[$c])) return (string)$row[$c];
     }
-    return $fields + ['__submission_id' => $id];
-  };
-
-  if ($needle !== '') {
-    $id = $wpdb->get_var($wpdb->prepare(
-      "SELECT s.id FROM {$tbl_sub} s JOIN {$tbl_vals} v ON v.submission_id = s.id
-       WHERE v.`key` IN ($inUrl) AND v.`value` LIKE %s
-         AND s.created_at BETWEEN %s AND %s
-       ORDER BY s.created_at DESC LIMIT 1",
-      ...array_merge($urlKeys, [$like, $from, $to])
-    )); if ($id) return $take_one((int)$id);
-    $id = $wpdb->get_var($wpdb->prepare(
-      "SELECT s.id FROM {$tbl_sub} s
-       WHERE s.source LIKE %s AND s.created_at BETWEEN %s AND %s
-       ORDER BY s.created_at DESC LIMIT 1", $like, $from, $to
-    )); if ($id) return $take_one((int)$id);
-    $id = $wpdb->get_var($wpdb->prepare(
-      "SELECT s.id FROM {$tbl_sub} s JOIN {$tbl_vals} v ON v.submission_id = s.id
-       WHERE v.`key` IN ($inUrl) AND v.`value` LIKE %s
-         AND s.created_at <= %s
-       ORDER BY s.created_at DESC LIMIT 1",
-      ...array_merge($urlKeys, [$like, $to])
-    )); if ($id) return $take_one((int)$id);
-    $id = (int)$wpdb->get_var($wpdb->prepare(
-      "SELECT s.id FROM {$tbl_sub} s
-       WHERE s.source LIKE %s AND s.created_at <= %s
-       ORDER BY s.created_at DESC LIMIT 1", $like, $to
-    )); if ($id) return $take_one((int)$id);
-  }
-  $id = (int)$wpdb->get_var($wpdb->prepare(
-    "SELECT s.id FROM {$tbl_sub} s
-     WHERE s.created_at <= %s
-     ORDER BY s.created_at DESC LIMIT 1", $to
-  ));
-  return $id ? $take_one((int)$id) : [];
+    return '';
 }
-function canonical_visitor_id(array $approval_row): string {
-  $raw = trim((string)($approval_row['visitor_id'] ?? ''));
-  if ($raw !== '' && preg_match('~^VID-[A-Za-z0-9\-]+$~', $raw)) return $raw;
-  $fields = fetch_submission_fields_via_context($approval_row, null);
-  if ($fields) {
-    $candidates = ['visitor_id','Visitor ID','visitorid','vid','fieldidvisitor_id','field_visitor_id','field_5196d27'];
-    foreach ($candidates as $k) {
-      if (!empty($fields[$k])) {
-        $val = trim((string)$fields[$k]);
-        $val = strtok($val, "\n\r");
-        if ($val !== '' && preg_match('~^VID-[A-Za-z0-9\-]+$~', $val)) return $val;
-      }
-    }
-  }
-  if ($raw !== '' && preg_match('~^(field|visitor)(_)?id~i', $raw)) $raw = '';
-  return $raw !== '' ? $raw : 'anonymous';
-}
-
-/* ===== صفحات ووردبريس ===== */
-function list_wp_pages(): array {
-  $pages = get_pages(['sort_column' => 'post_title', 'sort_order' => 'asc']);
-  $out = [];
-  foreach ($pages as $p) {
-    $out[] = ['ID'=>(int)$p->ID, 'title'=> get_the_title($p->ID) ?: '(بدون عنوان)', 'url'=> get_permalink($p->ID)];
-  }
-  return $out;
-}
-
-/* =====================[ Auth Flow ]===================== */
-if (isset($_GET['logout'])) { unset($_SESSION['logged_in']); flash_set('ok','تم تسجيل الخروج'); header('Location: dashboard.php'); exit; }
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && ($_POST['do'] ?? '') === 'login') {
-  if (!check_csrf($_POST['csrf'] ?? '')) { flash_set('err','انتهت صلاحية الجلسة'); header('Location: dashboard.php'); exit; }
-  $pass = (string)($_POST['password'] ?? '');
-  if (hash_equals($ADMIN_PASS, $pass)) { $_SESSION['logged_in']=true; flash_set('ok','تم تسجيل الدخول'); header('Location: dashboard.php'); exit; }
-  flash_set('err','بيانات الدخول غير صحيحة'); header('Location: dashboard.php'); exit;
-}
-$token = csrf_token();
-if (empty($_SESSION['logged_in'])):
-  $flash_ok=flash('ok'); $flash_err=flash('err'); ?>
-<!DOCTYPE html><html lang="ar" dir="rtl"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>تسجيل الدخول - لوحة الإدارة</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css">
-<style>
-:root{--bg:#0f172a;--card:#111827;--ring:#1f2937;--brand:#7c3aed;--txt:#e5e7eb}
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans Arabic",Tahoma,Arial,sans-serif;background:var(--bg);color:var(--txt)}
-.wrap{max-width:420px;margin:60px auto;padding:0 12px}.card{background:var(--card);border:1px solid var(--ring);border-radius:14px;box-shadow:0 10px 24px rgba(0,0,0,.35);padding:20px}
-h1{margin:0 0 14px;font-size:22px}label{display:block;margin:10px 0 6px}
-input{width:100%;padding:10px;border:1px solid var(--ring);border-radius:10px;background:#0b1220;color:#e5e7eb}
-.btn{width:100%;margin-top:12px;padding:12px;border-radius:10px;border:1px solid var(--brand);background:#7c3aed;color:#fff;font-weight:700;cursor:pointer}
-.alert{padding:10px;border-radius:10px;margin:8px 0}.alert.ok{background:#064e3b;border:1px solid #10b981}.alert.err{background:#7f1d1d;border:1px solid #ef4444}
-.hint{font-size:12px;color:#9ca3af;margin-top:8px}
-</style></head><body>
-<div class="wrap"><div class="card"><h1>تسجيل الدخول</h1>
-<?php if($flash_ok): ?><div class="alert ok"><?php echo e($flash_ok); ?></div><?php endif; ?>
-<?php if($flash_err): ?><div class="alert err"><?php echo e($flash_err); ?></div><?php endif; ?>
-<form method="post" action="dashboard.php" autocomplete="off">
-  <input type="hidden" name="csrf" value="<?php echo e($token); ?>">
-  <input type="hidden" name="do" value="login">
-  <label>كلمة المرور</label>
-  <input type="password" name="password" required>
-  <button class="btn" type="submit">دخول</button>
-  <div class="hint">ADMIN_PASS الافتراضي: <strong>change-me</strong> — غيّره داخل الملف.</div>
-</form></div></div></body></html>
-<?php exit; endif;
-
-/* =====================[ Actions (Delete + Manual Approve/Redirect) ]===================== */
-function redirect_with_kept_filters(array $extra = []){
-  $keep = $_GET; unset($keep['do'],$keep['id'],$keep['csrf'],$keep['visitor'],$keep['page_id']);
-  $q = array_merge($keep, $extra);
-  $qs = $q ? ('?' . http_build_query($q)) : '';
-  header('Location: dashboard.php' . $qs); exit;
-}
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
-  $do = $_POST['do'] ?? '';
-
-  // حذف واحد
-  if ($do === 'delete_one') {
-    if (!check_csrf($_POST['csrf'] ?? '')) { flash_set('err','انتهت صلاحية الجلسة، أعد المحاولة.'); redirect_with_kept_filters(); }
-    $id = (int)($_POST['id'] ?? 0);
-    if ($id > 0) {
-      $deleted = $wpdb->delete($table, ['id' => $id], ['%d']);
-      flash_set($deleted? 'ok':'err', $deleted? "تم حذف السجل #{$id} بنجاح.":"تعذّر حذف السجل #{$id}.");
-    } else {
-      flash_set('err','معرّف غير صالح للحذف.');
-    }
-    redirect_with_kept_filters();
-  }
-
-  // حذف الكل
-  if ($do === 'delete_all') {
-    if (!check_csrf($_POST['csrf'] ?? '')) { flash_set('err','انتهت صلاحية الجلسة، أعد المحاولة.'); redirect_with_kept_filters(); }
-    $_SESSION['__bulk_delete'] = true; redirect_with_kept_filters();
-  }
-
-  // موافقة + إعادة توجيه من الشريط
-  if ($do === 'manual_redirect') {
-    if (!check_csrf($_POST['csrf'] ?? '')) { flash_set('err','انتهت صلاحية الجلسة.'); redirect_with_kept_filters(); }
-    $visitor  = trim((string)($_POST['visitor'] ?? ''));
-    $page_id  = (int)($_POST['page_id'] ?? 0);
-
-    if ($visitor === '' || $visitor === 'anonymous') { flash_set('err','Visitor ID غير صالح.'); redirect_with_kept_filters(); }
-    $target_url = $page_id > 0 ? get_permalink($page_id) : '';
-    if ($target_url === '' || !filter_var($target_url, FILTER_VALIDATE_URL)) { flash_set('err','اختر صفحة صالحة لإعادة التوجيه.'); redirect_with_kept_filters(); }
-
-    // أحدث سجل مطابق لهذا الزائر بالضبط (كما هو مخزّن في الأعمدة)
-    $last_id = (int)$wpdb->get_var($wpdb->prepare(
-      "SELECT id FROM `{$table}` WHERE visitor_id=%s ORDER BY id DESC LIMIT 1", $visitor
-    ));
-    if ($last_id <= 0) { flash_set('err','لا يوجد سجل مطابق لهذا الزائر.'); redirect_with_kept_filters(); }
-
-    $updated = $wpdb->update(
-      $table,
-      ['status'=>'approved','redirect_url'=>$target_url,'updated_at'=>current_time('mysql', true)],
-      ['id'=>$last_id],
-      ['%s','%s','%s'],
-      ['%d']
-    );
-    if ($updated !== false) flash_set('ok', "تم اعتماد السجل #{$last_id} وتعيين إعادة التوجيه.");
-    else flash_set('err','تعذّر التحديث.');
-    redirect_with_kept_filters();
-  }
-}
-
-/* =====================[ Data / Filters ]===================== */
-$status      = isset($_GET['status']) && in_array($_GET['status'], ['pending','approved','rejected'], true) ? $_GET['status'] : null;
-$visitor_id  = isset($_GET['visitor_id']) ? trim((string)$_GET['visitor_id']) : '';
-
-$where = []; $args = [];
-if ($status)         { $where[]="status=%s";      $args[]=$status; }
-if ($visitor_id!==''){ $where[]="visitor_id=%s";  $args[]=$visitor_id; }
-
-$sql = "SELECT * FROM `{$table}`";
-if ($where) $sql .= " WHERE " . implode(' AND ', $where);
-$sql .= " ORDER BY id DESC LIMIT 400";
-$rows = $args ? $wpdb->get_results($wpdb->prepare($sql, ...$args), ARRAY_A) : $wpdb->get_results($sql, ARRAY_A);
-
-/* حذف الكل عند الطلب */
-if (!empty($_SESSION['__bulk_delete'])) {
-  unset($_SESSION['__bulk_delete']);
-  $ids_to_delete = array_map(function($r){ return (int)$r['id']; }, $rows ?: []);
-  if ($ids_to_delete) {
-    $ids_sql = implode(',', array_map('intval',$ids_to_delete));
-    $ok = $wpdb->query("DELETE FROM `{$table}` WHERE id IN ($ids_sql)");
-    flash_set($ok!==false?'ok':'err', $ok!==false? 'تم حذف جميع السجلات المعروضة بنجاح.':'تعذّر حذف السجلات.');
-  } else flash_set('ok','لا توجد سجلات مطابقة للحذف.');
-  redirect_with_kept_filters();
-}
-
-$last_id = !empty($rows) ? (int)$rows[0]['id'] : 0;
-
-/* =====================[ AJAX endpoints ]===================== */
-/* Ping (للواجهة الأمامية) */
-if (isset($_GET['ajax']) && $_GET['ajax']==='ping') {
-  $vid = isset($_GET['visitor_id']) ? trim((string)$_GET['visitor_id']) : '';
-  if ($vid!=='') {
-    $tbl = ensure_online_table();
-    $now = current_time('mysql', true);
-    $ip  = $_SERVER['REMOTE_ADDR'] ?? '';
-    $ua  = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 250);
-    $wpdb->query($wpdb->prepare(
-      "INSERT INTO `{$tbl}` (visitor_id,last_seen,ip,ua) VALUES (%s,%s,%s,%s)
-       ON DUPLICATE KEY UPDATE last_seen=VALUES(last_seen),ip=VALUES(ip),ua=VALUES(ua)",
-      $vid,$now,$ip,$ua
-    ));
-  }
-  header('Content-Type: application/json; charset=UTF-8'); echo json_encode(['ok'=>true], JSON_UNESCAPED_UNICODE); exit;
-}
-
-/* Online count (لوحة التحكم) */
-if (isset($_GET['ajax']) && $_GET['ajax']==='online_count') {
-  if (empty($_SESSION['logged_in'])) { http_response_code(403); echo json_encode(['err'=>'forbidden']); exit; }
-  header('Content-Type: application/json; charset=UTF-8');
-  $tbl = ensure_online_table();
-  $since = gmdate('Y-m-d H:i:s', time()-120);
-  $online = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$tbl}` WHERE last_seen >= %s", $since));
-  $since10 = gmdate('Y-m-d H:i:s', time()-600);
-  $fallback = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(DISTINCT visitor_id) FROM `{$table}` WHERE created_at >= %s AND visitor_id<>''", $since10));
-  echo json_encode(['online'=>$online,'fallback'=>$fallback], JSON_UNESCAPED_UNICODE); exit;
-}
-
-/* نافذة منبثقة: كل تسجيلات الزائر (مع استبعاد anonymous) */
-if (isset($_GET['ajax']) && $_GET['ajax']==='visitor_log') {
-  if (empty($_SESSION['logged_in'])) { http_response_code(403); exit('Forbidden'); }
-  $vid = isset($_GET['visitor_id']) ? trim((string)$_GET['visitor_id']) : '';
-  header('Content-Type: text/html; charset=UTF-8');
-  if ($vid==='' || $vid==='anonymous'){ echo '<div class="small">لا يمكن عرض سجلات زائر غير معروف.</div>'; exit; }
-
-  $recent = $wpdb->get_results("SELECT * FROM `{$table}` ORDER BY id DESC LIMIT 500", ARRAY_A);
-  $rows_v = [];
-  foreach ($recent as $row) {
-    if (canonical_visitor_id($row) === $vid) $rows_v[] = $row;
-  }
-  if (!$rows_v){ echo '<div class="small">لا توجد تسجيلات لهذا الزائر.</div>'; exit; }
-
-  $online = is_visitor_online($vid) ? '✅ متصل الآن' : '⛔ غير متصل';
-  echo '<div class="small" style="margin-bottom:8px">Visitor: <code>'.e($vid).'</code> — الحالة: <strong>'.$online.'</strong></div>';
-
-  echo '<div class="table-wrap" style="max-height:60vh;overflow:auto;border-radius:12px;border:1px solid #1f2937">';
-  echo '<table class="table" dir="rtl" style="width:100%;border-collapse:separate;border-spacing:0">';
-  echo '<thead><tr><th style="width:70px">#</th><th>المعلومات</th><th style="width:140px">الحالة</th><th>الصفحة/الرابط</th><th style="width:170px">التاريخ</th></tr></thead>';
-  echo '<tbody>';
-
-  foreach ($rows_v as $rv) {
-    $fields = fetch_submission_fields_via_context($rv, null);
-    $sid = (int)($fields['__submission_id'] ?? 0);
-    $page_title = page_title_from_url((string)($rv['redirect_url'] ?? ''));
-    $meta = get_submission_keys($sid, ['form_name','page_url','current_url','referrer','source_url']);
-    $form_name = $meta['form_name'] ?? '';
-    $display_page_title = $page_title ?: page_title_from_url($meta['page_url'] ?? ($meta['current_url'] ?? ''));
-    $visitor_name = $sid ? infer_visitor_name_from_submission($sid) : '';
-    if ($visitor_name==='') $visitor_name = '—';
-
-    echo '<tr>';
-    echo '<td>#'.(int)$rv['id'].'</td>';
-    echo '<td>';
-      echo '<div class="small" style="margin-bottom:6px"><b>اسم الزائر:</b> '.e($visitor_name).'</div>';
-      if ($form_name!=='') echo '<div class="small" style="margin-bottom:6px"><b>اسم النموذج:</b> '.e($form_name).'</div>';
-      if (!empty($fields)) {
-        echo '<div class="values" style="display:flex;flex-wrap:wrap;gap:6px">';
-        foreach ($fields as $k=>$v) {
-          if (in_array($k,['__submission_id','page_id','page_url','current_url','referrer','source_url','_wpnonce','form_name'], true)) continue;
-          echo '<div class="chip" style="background:#0b1220;border:1px solid #1f2937;border-radius:999px;padding:6px 10px;font-size:13px"><b>'.e($k).':</b>&nbsp;<span>'.nl2br(e($v)).'</span></div>';
+function parse_any_to_assoc($raw): array {
+    if (!is_string($raw) || $raw==='') return [];
+    $t = trim($raw);
+    if (($t[0]??'')==='{' || ($t[0]??'')==='[') {
+        $j = json_decode($raw, true);
+        if (json_last_error()===JSON_ERROR_NONE && is_array($j)) {
+            $out=[]; $it=function($p,$v) use (&$out,&$it){ if(is_array($v)){ foreach($v as $k=>$vv){ $it($p===''?(string)$k:($p.'.'.$k),$vv);} } else { if(is_object($v)) $v=json_decode(json_encode($v),true); if(is_array($v)) $v=json_encode($v,JSON_UNESCAPED_UNICODE); $out[$p]=(string)$v; } }; $it('',$j);
+            return $out;
         }
-        echo '</div>';
-      } else {
-        echo '<div class="small">— لا توجد حقول مطابقة.</div>';
-      }
-    echo '</td>';
-    echo '<td><span class="badge '.e($rv['status']).'">'.e($rv['status']==='pending'?'قيد المراجعة':($rv['status']==='approved'?'مقبول':'مرفوض')).'</span></td>';
-    echo '<td>';
-      $final_url = $rv['redirect_url'] ?: ($meta['page_url'] ?? $meta['current_url'] ?? $meta['referrer'] ?? $meta['source_url'] ?? '');
-      if ($final_url!=='') {
-        echo '<a class="link" href="'.e($final_url).'" target="_blank" rel="noopener">فتح</a>';
-        if ($display_page_title) echo '<div class="small">الصفحة: '.e($display_page_title).'</div>';
-        echo '<div class="small">'.e($final_url).'</div>';
-      } else {
-        echo '<span class="small">—</span>';
-      }
-    echo '</td>';
-    echo '<td>'.e($rv['created_at'] ?? '').'</td>';
-    echo '</tr>';
-  }
-  echo '</tbody></table></div>';
-  exit;
+    }
+    if (preg_match('/^(a|O|s|i|b|d):/', $t)) {
+        $u = @maybe_unserialize($raw);
+        if (is_array($u)) { $out=[]; foreach($u as $k=>$v){ if(is_array($v)||is_object($v)) $v=json_encode($v,JSON_UNESCAPED_UNICODE); $out[(string)$k]=(string)$v; } return $out; }
+    }
+    if (strpos($raw,'=')!==false && (strpos($raw,'&')!==false || strpos($raw,'%')!==false)) {
+        $arr=[]; parse_str($raw,$arr);
+        if ($arr){ $out=[]; foreach($arr as $k=>$v){ if(is_array($v)||is_object($v)) $v=json_encode($v,JSON_UNESCAPED_UNICODE); $out[(string)$k]=(string)$v; } return $out; }
+    }
+    $lines = preg_split('/\r\n|\r|\n/', $raw);
+    if ($lines && count($lines)>1) { $out=[]; foreach($lines as $ln){ if(strpos($ln,':')!==false){ [$k,$v]=array_map('trim',explode(':',$ln,2)); if($k!=='') $out[$k]=$v; } } if($out) return $out; }
+    return [];
+}
+function derive_page_info(array $row): array {
+    $label=''; $key='';
+    if (!empty($row['page_title'])) $label=(string)$row['page_title'];
+    $post_id=0;
+    if (!empty($row['post_id']) && ctype_digit((string)$row['post_id'])) $post_id=(int)$row['post_id'];
+    else {
+        $url=$row['page_url'] ?? ($row['referrer'] ?? '');
+        if ($url) { $maybe=url_to_postid($url); if ($maybe) $post_id=(int)$maybe; }
+    }
+    if ($post_id>0){ $t=get_the_title($post_id); if($t) $label=$label?:$t; $key='post:'.$post_id; }
+    else {
+        $url=$row['page_url'] ?? ($row['referrer'] ?? '');
+        if ($url){ $key='url:'.$url; if(!$label) $label=wp_strip_all_tags($url); }
+        elseif ($label){ $key='title:'.$label; }
+    }
+    if(!$label) $label='صفحة غير معروفة'; if(!$key) $key='unknown';
+    return ['page_label'=>$label,'page_key'=>$key];
+}
+function get_site_pages_options(): array {
+    $types=['page','post']; if (post_type_exists('product')) $types[]='product';
+    $q=new WP_Query(['post_type'=>$types,'post_status'=>'publish','posts_per_page'=>1000,'orderby'=>'title','order'=>'ASC','no_found_rows'=>true,'fields'=>'ids']);
+    $out=[]; if(!empty($q->posts)){ foreach($q->posts as $pid){ $out[]=['key'=>'site:post:'.$pid,'label'=>get_the_title($pid)?:('بدون عنوان #'.$pid),'url'=>get_permalink($pid)]; } }
+    return $out;
 }
 
-/* ====== تجميع لكل الزوار مع استبعاد anonymous ====== */
-$grouped = [];
-foreach ($rows as $r) {
-  $vid = canonical_visitor_id($r);
-  if ($vid === 'anonymous') continue; // <-- المطلوب
-  $grouped[$vid][] = $r;
+/** ------------- تجميع البيانات من المصادر ------------- **/
+function collect_elementor_submissions(?string $filterVisitorId=null, ?string $page_key=''): array {
+    global $wpdb;
+    $out=[]; $tblS=$wpdb->prefix.'e_submissions'; $tblV=$wpdb->prefix.'e_submissions_values';
+    if (!table_exists($tblS) || !table_exists($tblV)) return $out;
+
+    $ids=[];
+    if ($filterVisitorId){
+        $ids = $wpdb->get_col(
+            $wpdb->prepare("SELECT DISTINCT submission_id FROM `$tblV` WHERE value IN (%s,%s,%s) OR value LIKE %s",
+                $filterVisitorId, json_encode($filterVisitorId,JSON_UNESCAPED_UNICODE), serialize($filterVisitorId), '%'.$wpdb->esc_like($filterVisitorId).'%'
+            )
+        ) ?: [];
+    } else {
+        $ids = $wpdb->get_col("SELECT id FROM `$tblS` ORDER BY id DESC LIMIT 200") ?: [];
+    }
+    if (!$ids) return $out;
+
+    $idsFiltered = $ids;
+    if ($page_key){
+        $idsFiltered=[];
+        if (strpos($page_key,'post:')===0 || strpos($page_key,'site:post:')===0){
+            $pid=(int)preg_replace('~^(site:)?post:~','',$page_key);
+            if ($pid>0){ $url=get_permalink($pid);
+                $idsFiltered=$wpdb->get_col($wpdb->prepare("SELECT DISTINCT submission_id FROM `$tblV` WHERE (value=%s OR value=%s OR value=%s)", (string)$pid,(string)$url,(string)url_to_postid($url))) ?: [];
+                $idsFiltered=array_values(array_intersect($idsFiltered,$ids));
+            }
+        } elseif (strpos($page_key,'url:')===0){
+            $u=substr($page_key,4);
+            $idsFiltered=$wpdb->get_col($wpdb->prepare("SELECT DISTINCT submission_id FROM `$tblV` WHERE value=%s", $u)) ?: [];
+            $idsFiltered=array_values(array_intersect($idsFiltered,$ids));
+        } else { $idsFiltered=$ids; }
+    }
+    if (!$idsFiltered) return $out;
+
+    $ph=implode(',', array_fill(0,count($idsFiltered),'%d'));
+    $valuesRows=$wpdb->get_results($wpdb->prepare("SELECT * FROM `$tblV` WHERE submission_id IN ($ph) ORDER BY id ASC", ...array_map('intval',$idsFiltered)), ARRAY_A) ?: [];
+    $bySub=[];
+    foreach($valuesRows as $vr){
+        $sid=(int)$vr['submission_id']; if(!isset($bySub[$sid])) $bySub[$sid]=[];
+        $k=!empty($vr['field_id']) ? 'field_'.$vr['field_id'] : (!empty($vr['key'])?(string)$vr['key']:'value');
+        $bySub[$sid][$k]=(string)$vr['value'];
+        if (!empty($vr['key'])) $bySub[$sid][$vr['key']]=(string)$vr['value'];
+    }
+    $headers=$wpdb->get_results($wpdb->prepare("SELECT * FROM `$tblS` WHERE id IN ($ph) ORDER BY id DESC", ...array_map('intval',$idsFiltered)), ARRAY_A) ?: [];
+
+    foreach($headers as $h){
+        $sid=(int)$h['id']; $fields=$bySub[$sid] ?? [];
+        $visitor_id='';
+        foreach(['visitor_id','vid','visitor','_visitor','session_id'] as $cand){ if(!empty($fields[$cand])){ $visitor_id=(string)$fields[$cand]; break; } }
+        if(!$visitor_id && $filterVisitorId) $visitor_id=$filterVisitorId;
+
+        $row = [
+            'page_title' => $fields['page_title'] ?? '',
+            'page_url'   => $fields['page_url'] ?? ($fields['referer'] ?? ''),
+            'post_id'    => $fields['post_id'] ?? '',
+            'status'     => $h['status'] ?? ($fields['status'] ?? ''),
+        ];
+        $pi=derive_page_info($row);
+        $msg=$h['message'] ?? ($fields['message'] ?? ($fields['msg'] ?? ''));
+
+        $out[]=[
+            'source'=>'elementor',
+            'id'=>'elementor:'.$sid,
+            'visitor_id'=>$visitor_id,
+            'status'=>(string)($h['status'] ?? 'pending'),
+            'redirect_url'=>'',
+            '_created_at'=>get_created_at($h),
+            '_page_label'=>$pi['page_label'],
+            '_page_key'=>$pi['page_key'],
+            '_fields'=>$fields,
+            '_message'=>(string)$msg,
+            'raw'=>$h,
+        ];
+    }
+    return $out;
+}
+function collect_approvals(?string $filterVisitorId=null, ?string $page_key=''): array {
+    global $wpdb;
+    $out=[]; $table=$wpdb->prefix.'approvals';
+    if (!table_exists($table)) return $out;
+    $cols=get_columns($table);
+
+    $where='WHERE 1=1'; $params=[];
+    if ($filterVisitorId){ if(in_array('visitor_id',$cols,true)){ $where.=" AND visitor_id=%s"; $params[]=$filterVisitorId; } else { return $out; } }
+    if ($page_key){
+        if (strpos($page_key,'site:post:')===0 || strpos($page_key,'post:')===0){
+            $pid=(int)preg_replace('~^(site:)?post:~','',$page_key);
+            if ($pid>0){
+                if (in_array('post_id',$cols,true)){ $where.=" AND post_id=%d"; $params[]=$pid; }
+                elseif (in_array('page_url',$cols,true)){ $where.=" AND page_url=%s"; $params[]=get_permalink($pid); }
+            }
+        } elseif (strpos($page_key,'url:')===0){
+            $u=substr($page_key,4);
+            if (in_array('page_url',$cols,true)){ $where.=" AND page_url=%s"; $params[]=$u; }
+            elseif (in_array('referrer',$cols,true)){ $where.=" AND referrer=%s"; $params[]=$u; }
+        } elseif (strpos($page_key,'title:')===0){
+            $t=substr($page_key,6);
+            if (in_array('page_title',$cols,true)){ $where.=" AND page_title=%s"; $params[]=$t; }
+        } elseif ($page_key==='unknown'){
+            $cond=[]; foreach(['post_id','page_url','referrer','page_title'] as $c){ if(in_array($c,$cols,true)) $cond[]="($c IS NULL OR $c='')"; }
+            if ($cond) $where.=" AND ".implode(' AND ',$cond);
+        }
+    }
+    $sql="SELECT * FROM `$table` $where ORDER BY id DESC LIMIT 1000";
+    $rows=$params ? $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) : $wpdb->get_results($sql, ARRAY_A);
+    foreach($rows as $r){
+        $pi=derive_page_info($r);
+        $fields=[];
+        foreach(['payload','form_data','fields','submission','data','meta'] as $cand){ if(!empty($r[$cand])){ $tmp=parse_any_to_assoc((string)$r[$cand]); if($tmp){ $fields=$tmp; break; } } }
+        foreach(get_columns($table) as $c){ if(stripos($c,'field_')===0 && !empty($r[$c])) $fields[$c]=(string)$r[$c]; }
+        foreach(['name','email','phone','message'] as $g){ if(!empty($r[$g])) $fields[$g]=(string)$r[$g]; }
+        $out[]=[
+            'source'=>'approvals','id'=>'approvals:'.$r['id'],
+            'visitor_id'=>(string)($r['visitor_id'] ?? ''),'status'=>(string)($r['status'] ?? 'pending'),
+            'redirect_url'=>(string)($r['redirect_url'] ?? ''),'_created_at'=>get_created_at($r),
+            '_page_label'=>$pi['page_label'],'_page_key'=>$pi['page_key'],
+            '_fields'=>$fields,'_message'=>(string)($r['message'] ?? ($fields['message'] ?? '')),
+            'raw'=>$r,
+        ];
+    }
+    return $out;
+}
+function collect_custom_submissions(?string $filterVisitorId=null, ?string $page_key=''): array {
+    global $wpdb;
+    $out=[];
+    foreach(['submissions','wp_submissions'] as $name){
+        $table=$name; if($name==='wp_submissions') $table=$wpdb->prefix.'submissions';
+        if (!table_exists($table)) continue;
+        $cols=get_columns($table);
+        $where='WHERE 1=1'; $params=[];
+        if ($filterVisitorId){
+            if(in_array('visitor_id',$cols,true)){ $where.=" AND visitor_id=%s"; $params[]=$filterVisitorId; }
+            else {
+                foreach(['payload','data','fields','form_data','meta','body','content'] as $cand){ if(in_array($cand,$cols,true)){ $where.=" AND $cand LIKE %s"; $params[]='%'.$wpdb->esc_like($filterVisitorId).'%'; break; } }
+            }
+        }
+        if ($page_key){
+            if (strpos($page_key,'site:post:')===0 || strpos($page_key,'post:')===0){
+                $pid=(int)preg_replace('~^(site:)?post:~','',$page_key);
+                if ($pid>0){
+                    if (in_array('post_id',$cols,true)){ $where.=" AND post_id=%d"; $params[]=$pid; }
+                    elseif (in_array('page_url',$cols,true)){ $where.=" AND page_url=%s"; $params[]=get_permalink($pid); }
+                }
+            } elseif (strpos($page_key,'url:')===0){
+                $u=substr($page_key,4); if (in_array('page_url',$cols,true)){ $where.=" AND page_url=%s"; $params[]=$u; }
+            } elseif (strpos($page_key,'title:')===0){
+                $t=substr($page_key,6); if (in_array('page_title',$cols,true)){ $where.=" AND page_title=%s"; $params[]=$t; }
+            }
+        }
+        $sql="SELECT * FROM `$table` $where ORDER BY id DESC LIMIT 1000";
+        $rows=$params ? $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) : $wpdb->get_results($sql, ARRAY_A);
+        foreach($rows as $r){
+            $pi=derive_page_info($r); $fields=[];
+            foreach(['payload','data','fields','form_data','meta','body','content'] as $cand){ if(!empty($r[$cand])){ $tmp=parse_any_to_assoc((string)$r[$cand]); if($tmp){ $fields=$tmp; break; } } }
+            foreach($cols as $c){ if(stripos($c,'field_')===0 && !empty($r[$c])) $fields[$c]=(string)$r[$c]; }
+            foreach(['name','email','phone','message'] as $g){ if(!empty($r[$g])) $fields[$g]=(string)$r[$g]; }
+            $out[]=[
+                'source'=>$name,'id'=>$name.':'.$r['id'],'visitor_id'=>(string)($r['visitor_id'] ?? ''),
+                'status'=>(string)($r['status'] ?? 'pending'),'redirect_url'=>(string)($r['redirect_url'] ?? ''),
+                '_created_at'=>get_created_at($r),'_page_label'=>$pi['page_label'],'_page_key'=>$pi['page_key'],
+                '_fields'=>$fields,'_message'=>(string)($r['message'] ?? ($fields['message'] ?? '')),'raw'=>$r,
+            ];
+        }
+    }
+    return $out;
+}
+function build_groups_and_pages(?string $filterVisitorId=null): array {
+    $all = array_merge(
+        collect_elementor_submissions($filterVisitorId, ''),
+        collect_approvals($filterVisitorId, ''),
+        collect_custom_submissions($filterVisitorId, '')
+    );
+    foreach($all as &$it){
+        if (empty($it['visitor_id'])){
+            $f=$it['_fields'] ?? [];
+            foreach(['visitor_id','vid','email','phone','mobile','session_id'] as $cand){ if(!empty($f[$cand])){ $it['visitor_id']=(string)$f[$cand]; break; } }
+        }
+    } unset($it);
+    if ($filterVisitorId) $all = array_values(array_filter($all, fn($x)=> (string)$x['visitor_id']===(string)$filterVisitorId));
+
+    $groups=[];
+    foreach($all as $item){
+        $vid=(string)($item['visitor_id'] ?: 'UNKNOWN');
+        if(!isset($groups[$vid])) $groups[$vid]=['items'=>[],'pages'=>[],'last'=>null];
+        $groups[$vid]['items'][]=$item;
+        $groups[$vid]['last'] = $groups[$vid]['last']
+            ? ( ((int)preg_replace('~.*:~','',$groups[$vid]['last']['id']) < (int)preg_replace('~.*:~','',$item['id'])) ? $item : $groups[$vid]['last'] )
+            : $item;
+        $k=$item['_page_key'] ?? 'unknown'; $l=$item['_page_label'] ?? 'صفحة غير معروفة';
+        if(!isset($groups[$vid]['pages'][$k])) $groups[$vid]['pages'][$k]=$l;
+    }
+    $out=[];
+    foreach($groups as $vid=>$g){
+        $pages=[]; foreach($g['pages'] as $k=>$l) $pages[]=['key'=>$k,'label'=>$l];
+        $last=$g['last'] ?: ['status'=>'pending','id'=>'0'];
+        $out[]=[
+            'visitor_id'=>$vid,
+            'count'=>count($g['items']),
+            'last_id'=>(int)preg_replace('~.*:~','',$last['id']),
+            'last_status'=>$last['status'] ?? 'pending',
+            'redirect_url'=>$last['redirect_url'] ?? '',
+            'visitor_pages'=>$pages,
+        ];
+    }
+    usort($out, fn($a,$b)=> $b['last_id'] <=> $a['last_id']); // الأحدث أولاً
+    return [$out,$all];
 }
 
-$pages = list_wp_pages(); // لاستخدامها في القوائم المنسدلة
-$flash_ok=flash('ok'); $flash_err=flash('err');
+/** ------------- إجراءات الحذف (AJAX) ------------- **/
+function delete_by_visitor_all_sources(string $visitor_id): array {
+    global $wpdb;
+    $affected = ['elementor'=>0,'approvals'=>0,'custom'=>0];
+
+    // Elementor
+    $tblS=$wpdb->prefix.'e_submissions'; $tblV=$wpdb->prefix.'e_submissions_values';
+    if (table_exists($tblS) && table_exists($tblV)){
+        $ids = $wpdb->get_col(
+            $wpdb->prepare("SELECT DISTINCT submission_id FROM `$tblV` WHERE value IN (%s,%s,%s) OR value LIKE %s",
+                $visitor_id, json_encode($visitor_id,JSON_UNESCAPED_UNICODE), serialize($visitor_id), '%'.$wpdb->esc_like($visitor_id).'%'
+            )
+        ) ?: [];
+        if ($ids){
+            $ph=implode(',', array_fill(0,count($ids),'%d')); $idsI=array_map('intval',$ids);
+            $affV = $wpdb->query($wpdb->prepare("DELETE FROM `$tblV` WHERE submission_id IN ($ph)", ...$idsI));
+            $affS = $wpdb->query($wpdb->prepare("DELETE FROM `$tblS` WHERE id IN ($ph)", ...$idsI));
+            $affected['elementor'] = (int)($affS ?: 0);
+        }
+    }
+    // approvals
+    $appt=$wpdb->prefix.'approvals';
+    if (table_exists($appt) && in_array('visitor_id', get_columns($appt), true)){
+        $aff = $wpdb->query($wpdb->prepare("DELETE FROM `$appt` WHERE visitor_id=%s", $visitor_id));
+        $affected['approvals'] = (int)($aff ?: 0);
+    }
+    // custom
+    foreach(['submissions','wp_submissions'] as $name){
+        $table=$name; if($name==='wp_submissions') $table=$wpdb->prefix.'submissions';
+        if (!table_exists($table)) continue;
+        $cols=get_columns($table);
+        if (in_array('visitor_id',$cols,true)){
+            $aff=$wpdb->query($wpdb->prepare("DELETE FROM `$table` WHERE visitor_id=%s", $visitor_id));
+            $affected['custom'] += (int)($aff ?: 0);
+        } else {
+            // بحث داخل payload-like ثم حذف باستخدام id
+            foreach(['payload','data','fields','form_data','meta','body','content'] as $cand){
+                if (in_array($cand,$cols,true)){
+                    $ids=$wpdb->get_col($wpdb->prepare("SELECT id FROM `$table` WHERE $cand LIKE %s", '%'.$wpdb->esc_like($visitor_id).'%')) ?: [];
+                    if ($ids){ $ph=implode(',', array_fill(0,count($ids),'%d')); $wpdb->query($wpdb->prepare("DELETE FROM `$table` WHERE id IN ($ph)", ...array_map('intval',$ids))); $affected['custom'] += count($ids); }
+                    break;
+                }
+            }
+        }
+    }
+
+    return $affected;
+}
+function delete_all_sources(): array {
+    global $wpdb;
+    $affected = ['elementor'=>0,'approvals'=>0,'custom'=>0];
+
+    // Elementor (احذف الرأس والقيم)
+    $tblS=$wpdb->prefix.'e_submissions'; $tblV=$wpdb->prefix.'e_submissions_values';
+    if (table_exists($tblS)) { $affS = $wpdb->query("TRUNCATE TABLE `$tblS`"); $affected['elementor'] += (int)($affS!==false ? $wpdb->rows_affected : 0); }
+    if (table_exists($tblV)) { $affV = $wpdb->query("TRUNCATE TABLE `$tblV`"); }
+
+    // approvals
+    $appt=$wpdb->prefix.'approvals';
+    if (table_exists($appt)) { $wpdb->query("TRUNCATE TABLE `$appt`"); }
+
+    // custom
+    foreach(['submissions','wp_submissions'] as $name){
+        $table=$name; if($name==='wp_submissions') $table=$wpdb->prefix.'submissions';
+        if (table_exists($table)) { $wpdb->query("TRUNCATE TABLE `$table`"); }
+    }
+    return $affected;
+}
+
+/** ------------- نهايات AJAX (قائمة/تفاصيل/حذف) ------------- **/
+if (isset($_GET['action']) && $_GET['action']==='list') {
+    header('Content-Type: application/json; charset=utf-8');
+    $filterVid = isset($_GET['vid']) ? (string)$_GET['vid'] : null;
+    [$groups,$allItems] = build_groups_and_pages($filterVid);
+    echo json_encode([
+        'ok'=>true,
+        'items'=>$groups,
+        'sitePages'=>get_site_pages_options(),
+        'max_id'=>array_reduce($groups, fn($m,$i)=>max($m,(int)$i['last_id']), 0),
+        'csrf'=>'<?php echo $CSRF; ?>'
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+if (isset($_GET['action']) && $_GET['action']==='details') {
+    header('Content-Type: application/json; charset=utf-8');
+    $visitor_id = isset($_GET['visitor_id']) ? (string)$_GET['visitor_id'] : '';
+    $page_key   = isset($_GET['page']) ? (string)$_GET['page'] : '';
+    if ($visitor_id===''){ echo json_encode(['ok'=>false,'error'=>'visitor_id مفقود'], JSON_UNESCAPED_UNICODE); exit; }
+
+    $items = array_merge(
+        collect_elementor_submissions($visitor_id, $page_key),
+        collect_approvals($visitor_id, $page_key),
+        collect_custom_submissions($visitor_id, $page_key)
+    );
+    if ($page_key){
+        $items = array_values(array_filter($items, function($x) use ($page_key){
+            if (empty($x['_page_key'])) return $page_key==='unknown';
+            if ($page_key==='unknown')  return $x['_page_key']==='unknown';
+            return $x['_page_key']===$page_key;
+        }));
+    }
+    usort($items, function($a,$b){
+        $ta = strtotime($a['_created_at'] ?? '') ?: 0;
+        $tb = strtotime($b['_created_at'] ?? '') ?: 0;
+        if ($ta !== $tb) return $tb <=> $ta; // الأحدث أولاً
+        return (int)preg_replace('~.*:~','',$b['id']) <=> (int)preg_replace('~.*:~','',$a['id']);
+    });
+
+    echo json_encode(['ok'=>true,'visitor_id'=>$visitor_id,'items'=>$items], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+if (isset($_GET['action']) && $_GET['action']==='delete_visitor' && $_SERVER['REQUEST_METHOD']==='POST') {
+    header('Content-Type: application/json; charset=utf-8');
+    $token = $_POST['csrf'] ?? '';
+    if (!hash_equals($_SESSION['csrf'] ?? '', (string)$token)) { echo json_encode(['ok'=>false,'error'=>'CSRF']); exit; }
+    $visitor_id = isset($_POST['visitor_id']) ? (string)$_POST['visitor_id'] : '';
+    if ($visitor_id===''){ echo json_encode(['ok'=>false,'error'=>'visitor_id مفقود']); exit; }
+
+    $aff = delete_by_visitor_all_sources($visitor_id);
+    echo json_encode(['ok'=>true,'deleted'=>$aff], JSON_UNESCAPED_UNICODE); exit;
+}
+if (isset($_GET['action']) && $_GET['action']==='delete_all' && $_SERVER['REQUEST_METHOD']==='POST') {
+    header('Content-Type: application/json; charset=utf-8');
+    $token = $_POST['csrf'] ?? '';
+    if (!hash_equals($_SESSION['csrf'] ?? '', (string)$token)) { echo json_encode(['ok'=>false,'error'=>'CSRF']); exit; }
+    $confirm = isset($_POST['confirm']) ? (string)$_POST['confirm'] : '';
+    if ($confirm!=='YES'){ echo json_encode(['ok'=>false,'error'=>'الرجاء إدخال YES للتأكيد']); exit; }
+
+    $aff = delete_all_sources();
+    echo json_encode(['ok'=>true,'deleted'=>$aff], JSON_UNESCAPED_UNICODE); exit;
+}
+
+/** ------------------ واجهة المستخدم ------------------ **/
 ?>
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>لوحة التحكم</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css">
 <style>
-:root{--bg:#0b1120;--card:#0a0f1f;--ring:#1f2937;--ok:#10b981;--bad:#ef4444;--txt:#e5e7eb;--muted:#94a3b8}
+:root{--bg:#f8fafc;--card:#fff;--muted:#64748b;--ring:#e2e8f0;--ok:#16a34a;--bad:#dc2626;--brand:#0ea5e9}
 *{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans Arabic",Tahoma,Arial,sans-serif;background:var(--bg);color:var(--txt)}
-.wrap{max-width:1280px;margin:18px auto;padding:0 12px}
-.header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-h1{margin:0;font-size:24px}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--ring);
-  background:#0f172a;text-decoration:none;color:#e5e7eb;font-weight:700;cursor:pointer}
-.btn.bad{background:#7f1d1d;border-color:#7f1d1d}
-.card{background:linear-gradient(180deg, rgba(255,255,255,.02), transparent 20%) ,var(--card);border:1px solid var(--ring);
-  border-radius:18px;box-shadow:0 10px 24px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.03);padding:14px;margin:12px 0}
-.tile{background:#0f172a;border:1px solid var(--ring);border-radius:14px;padding:12px 16px;min-width:190px}
-.num{font-size:28px;font-weight:800}
-.small{font-size:12px;color:#9ca3b8}
-.badge{padding:3px 9px;border-radius:999px;font-size:12px;font-weight:800}
-.approved{background:#10b981;color:#083344}.rejected{background:#ef4444;color:#111827}
-.alert{padding:10px;border-radius:10px;margin:8px 0}
-.alert.ok{background:#064e3b;border:1px solid #10b981}.alert.err{background:#7f1d1d;border:1px solid #ef4444}
-
-/* ======== شرائط الزوار ======== */
-.visitor-strip{border:2px solid #ffffff;border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:8px;background:#0b1220}
-.strip-head{display:flex;align-items:center;gap:10px;justify-content:space-between}
-.head-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.head-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-select, .mini-input{padding:6px 8px;border:1px solid #1f2937;border-radius:10px;background:#0b1220;color:#e5e7eb;font-size:12px}
-.mini-btn{padding:7px 10px;border-radius:10px;border:1px solid var(--ring);background:#0f172a;color:#e5e7eb;font-weight:700;cursor:pointer;font-size:12px}
-.mini-btn.ok{background:#065f46;border-color:#065f46}
-.entries{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px}
-.pill{display:inline-flex;gap:6px;align-items:center;background:#111827;border:1px solid #1f2937;border-radius:999px;padding:6px 10px;font-size:12px;white-space:nowrap}
-.pill .pill-id{font-weight:800}
-.pill .pill-name{opacity:.9}
-.pill .pill-time{opacity:.7}
-.strips-grid{display:flex;flex-direction:column;gap:12px}
-.kpi{display:flex;gap:12px;flex-wrap:wrap;margin:8px 0}
-.sticky-bar{position:sticky;top:8px;z-index:5}
+body{font-family:system-ui,-apple-system,Segoe UI,Tahoma,Arial;background:var(--bg);margin:0;color:#0f172a}
+.header{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:16px 20px;background:#fff;border-bottom:1px solid var(--ring);position:sticky;top:0;z-index:5}
+.header h1{font-size:18px;margin:0}
+.container{padding:20px;max-width:1200px;margin-inline:auto}
+.grid{display:grid;grid-template-columns:1fr;gap:12px}
+@media(min-width:980px){.grid{grid-template-columns:1fr 1fr}}
+.bar{display:flex;align-items:center;justify-content:space-between;background:var(--card);border:1px solid var(--ring);border-radius:14px;padding:12px 14px;gap:10px;box-shadow:0 6px 18px rgba(0,0,0,.04);flex-wrap:wrap}
+.left{display:flex;align-items:center;gap:8px;min-width:260px;flex:1}
+.bar .id{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:360px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;background:#f1f5f9;color:#0f172a;border:1px solid var(--ring)}
+.count{font-weight:700}
+.status{padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid var(--ring)}
+.status.pending{background:#fffbeb}
+.status.approved{background:#ecfdf5;color:#065f46}
+.status.rejected{background:#fef2f2;color:#991b1b}
+select.page-filter{padding:7px 10px;border:1px solid var(--ring);border-radius:10px;background:#fff;max-width:360px}
+.btn{appearance:none;border:0;background:var(--brand);color:#fff;padding:8px 12px;border-radius:10px;cursor:pointer}
+.btn.ghost{background:#fff;color:#0f172a;border:1px solid var(--ring)}
+.btn.danger{background:#ef4444}
+.btn.small{padding:6px 10px;font-size:13px}
+.tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.hint{color:var(--muted);font-size:12px;margin-top:8px}
+.modal{position:fixed;inset:0;background:rgba(2,6,23,.48);display:none;align-items:center;justify-content:center;padding:12px;z-index:20}
+.modal.open{display:flex}
+.dialog{background:#fff;width:min(96vw,1200px);max-height:86vh;border-radius:16px;overflow:hidden;display:flex;flex-direction:column;border:1px solid var(--ring)}
+.dialog header{display:flex;align-items:center;gap:8px;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--ring);flex-wrap:wrap}
+.dialog h3{margin:0;font-size:16px}
+.dialog .content{padding:0;overflow:auto}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:10px;border-bottom:1px solid var(--ring);text-align:right;font-size:13px;vertical-align:top}
+.table th{background:#f8fafc;position:sticky;top:0;z-index:1}
+.kv{display:grid;grid-template-columns:160px 1fr;gap:6px}
+.kv div{padding:6px 8px;border:1px solid var(--ring);border-radius:8px;background:#fff}
+.kv .k{background:#f8fafc;font-weight:600}
+.raw{margin-top:8px}
+.raw pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--ring);border-radius:8px;padding:8px}
+.row-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+a.btn-link,a.btn-out{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border-radius:10px;text-decoration:none;color:#fff}
+a.btn-link{background:#0ea5e9}
+a.btn-out{background:#ef4444}
+.empty{padding:24px;text-align:center;color:#64748b}
+.refresh-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block}
+.small{font-size:12px;color:#64748b}
+.note{font-size:12px;color:#991b1b}
 </style>
 </head>
 <body>
-<div class="wrap" id="app" data-status="<?php echo e($status?:''); ?>" data-visitor="<?php echo e($visitor_id); ?>">
-
   <div class="header">
     <h1>لوحة التحكم</h1>
-    <div class="toolbar sticky-bar">
-      <form method="get" class="form-inline" action="dashboard.php" style="display:flex;gap:6px;align-items:center">
-        <?php if($status): ?><input type="hidden" name="status" value="<?php echo e($status); ?>"><?php endif; ?>
-        <label for="visitor_id">فلترة بالزائر:</label>
-        <input id="visitor_id" name="visitor_id" type="text" placeholder="Visitor ID" value="<?php echo e($visitor_id); ?>" style="padding:9px 10px;border:1px solid #1f2937;border-radius:10px;background:#0b1220;color:#e5e7eb" />
-        <button class="btn" type="submit">تطبيق</button>
-        <?php if($visitor_id!==''): ?>
-          <a class="btn" href="?<?php $keep=$_GET; unset($keep['visitor_id']); echo http_build_query($keep); ?>">مسح الفلتر</a>
-        <?php endif; ?>
-      </form>
-
-      <form method="post" onsubmit="return confirm('سيتم حذف جميع السجلات المعروضة. تأكيد؟');">
-        <input type="hidden" name="csrf" value="<?php echo e($token); ?>">
-        <input type="hidden" name="do" value="delete_all">
-        <button class="btn bad" type="submit">🗑️ حذف الكل</button>
-      </form>
-
-      <a class="btn" href="?logout=1" onclick="return confirm('تأكيد تسجيل الخروج؟');">تسجيل الخروج</a>
+    <div class="tools">
+      <button class="btn ghost" id="manualRefresh" title="تحديث الآن">تحديث</button>
+      <button class="btn danger" id="deleteAllBtn" title="حذف كل الإرسالات">حذف الكل</button>
+      <span class="hint"><span class="refresh-dot" id="liveDot"></span> تحديث تلقائي كل 5 ثوانٍ</span>
     </div>
   </div>
 
-  <?php if($flash_ok): ?><div class="alert ok"><?php echo e($flash_ok); ?></div><?php endif; ?>
-  <?php if($flash_err): ?><div class="alert err"><?php echo e($flash_err); ?></div><?php endif; ?>
-
-  <div class="kpi">
-    <div class="tile"><div class="small">آخر ID محمّل</div><div class="num" id="last-id"><?php echo (int)$last_id; ?></div></div>
-    <div class="tile"><div class="small">عدد الزوار المعروضين</div><div class="num" id="shown-count"><?php echo count($grouped); ?></div></div>
-    <div class="tile"><div class="small">المتصلون الآن</div><div class="num" id="online-now">—</div><div class="small" id="online-fallback" style="margin-top:2px;color:#94a3b8"></div></div>
+  <div class="container">
+    <div id="bars" class="grid" aria-live="polite" aria-busy="false"></div>
+    <p id="emptyState" class="empty" style="display:none">لا توجد طلبات بعد.</p>
+    <p class="note">تنبيه: "حذف الكل" يمسح كل الإرسالات من Elementor والاعتمادات وأي جداول submissions مخصصة.</p>
   </div>
 
-  <!-- ====== الشرائط (anonymous مستبعد) ====== -->
-  <div id="visitorStrips" class="strips-grid">
-    <?php foreach($grouped as $vid=>$entries): 
-      $isOnline = is_visitor_online($vid);
-    ?>
-    <div class="visitor-strip" data-visitor="<?php echo e($vid); ?>">
-      <div class="strip-head">
-        <div class="head-left">
-          <div><b>Visitor:</b> <code><?php echo e($vid); ?></code></div>
-          <span class="badge <?php echo $isOnline?'approved':'rejected'; ?>"><?php echo $isOnline?'متصل الآن':'غير متصل'; ?></span>
+  <div class="modal" id="modal">
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header>
+        <h3 id="modalTitle">تفاصيل الزائر</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label for="modalPageSel">تصفية حسب الصفحة:</label>
+          <select id="modalPageSel" class="page-filter"></select>
         </div>
-
-        <!-- زر موافقة + توجيه مع قائمة الصفحات -->
-        <div class="head-actions">
-          <form method="post" onsubmit="return confirm('سيتم اعتماد أحدث سجل لهذا الزائر وتعيين إعادة التوجيه. متابعة؟');" style="display:flex;gap:6px;align-items:center">
-            <input type="hidden" name="csrf" value="<?php echo e($token); ?>">
-            <input type="hidden" name="do" value="manual_redirect">
-            <input type="hidden" name="visitor" value="<?php echo e($vid); ?>">
-            <select name="page_id" required>
-              <option value="">— اختر صفحة —</option>
-              <?php foreach($pages as $pg): ?>
-                <option value="<?php echo (int)$pg['ID']; ?>"><?php echo e($pg['title']); ?></option>
-              <?php endforeach; ?>
-            </select>
-            <button class="mini-btn ok" type="submit">✅ موافقة + توجيه</button>
-          </form>
-
-          <!-- فتح التفاصيل (اختياري) -->
-          <a href="#" class="mini-btn view-all" data-visitor="<?php echo e($vid); ?>">عرض التفاصيل</a>
-        </div>
-      </div>
-
-      <div class="entries">
-        <?php
-          foreach($entries as $r){
-            $fields = fetch_submission_fields_via_context($r, null);
-            $sid = (int)($fields['__submission_id'] ?? 0);
-            $meta = $sid ? get_submission_keys($sid, ['form_name']) : [];
-            $form_name = $meta['form_name'] ?? 'form';
-            echo '<div class="pill" title="#'.(int)$r['id'].' • '.e($form_name).' • '.e($r['created_at']).'">'.
-                   '<span class="pill-id">#'.(int)$r['id'].'</span>'.
-                   '<span class="pill-name">'.e($form_name).'</span>'.
-                   '<span class="pill-time">'.e($r['created_at']).'</span>'.
-                 '</div>';
-          }
-        ?>
+        <button class="btn ghost" id="closeModal">إغلاق</button>
+      </header>
+      <div class="content">
+        <table class="table" id="detailsTable"></table>
       </div>
     </div>
-    <?php endforeach; ?>
   </div>
-
-</div>
-
-<!-- Modal -->
-<div class="modal-backdrop" id="visitorModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="visitorModalTitle" style="width:min(100%, 980px);max-height:80vh;background:#0a0f1f;border:1px solid #1f2937;border-radius:16px;box-shadow:0 20px 40px rgba(0,0,0,.5);display:flex;flex-direction:column">
-    <div class="modal-header" style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #1f2937">
-      <div class="modal-title" id="visitorModalTitle" style="font-weight:800">سجلات الزائر</div>
-      <div class="modal-actions" style="display:flex;gap:8px;align-items:center">
-        <a class="mini-btn" id="openAsPage" href="#" target="_blank" rel="noopener">فتح كصفحة</a>
-        <button class="mini-btn bad" id="closeModal" type="button">إغلاق</button>
-      </div>
-    </div>
-    <div class="modal-body" id="visitorModalBody" style="padding:12px;overflow:auto"><div class="small">اختر زائرًا لعرض التفاصيل…</div></div>
-  </div>
-</div>
 
 <script>
 (function(){
-  var stripsWrap = document.getElementById('visitorStrips');
+  const barsEl = document.getElementById('bars');
+  const emptyEl = document.getElementById('emptyState');
+  const liveDot = document.getElementById('liveDot');
+  const manualBtn = document.getElementById('manualRefresh');
+  const deleteAllBtn = document.getElementById('deleteAllBtn');
 
-  // فتح المودال
-  var modal = document.getElementById('visitorModal'),
-      modalBody = document.getElementById('visitorModalBody'),
-      openAsPage = document.getElementById('openAsPage');
+  const modal = document.getElementById('modal');
+  const closeModal = document.getElementById('closeModal');
+  const detailsTable = document.getElementById('detailsTable');
+  const modalTitle = document.getElementById('modalTitle');
+  const modalPageSel = document.getElementById('modalPageSel');
 
-  function openModalForVisitor(vid){
-    if (vid === 'anonymous') return;
-    var pageUrl = new URL(window.location.href);
-    pageUrl.searchParams.set('view','visitor');
-    pageUrl.searchParams.set('visitor_id', vid);
-    openAsPage.href = pageUrl.toString();
+  let latestMaxId = 0;
+  let csrf = '';
+  const pageSelectionByVisitor = new Map(); // visitor_id -> page_key
 
-    var url = new URL(window.location.href);
-    url.searchParams.set('ajax','visitor_log');
-    url.searchParams.set('visitor_id', vid);
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&gt;','>':'&lt;','"':'&quot;', "'":'&#039;' }[m]));
+  const statusClass = st => (st||'pending').toLowerCase();
 
-    modalBody.innerHTML = '<div class="small">جاري التحميل…</div>';
-    modal.style.display = 'flex';
-    fetch(url.toString(), {credentials:'same-origin'})
-      .then(r => r.text())
-      .then(html => { modalBody.innerHTML = html; })
-      .catch(() => { modalBody.innerHTML = '<div class="small">تعذّر تحميل السجلات.</div>'; });
+  function toast(msg){
+    const t=document.createElement('div');
+    t.textContent=msg;
+    Object.assign(t.style,{position:'fixed',bottom:'16px',left:'50%',transform:'translateX(-50%)',background:'#111827',color:'#fff',padding:'10px 14px',borderRadius:'10px',zIndex:50,boxShadow:'0 10px 30px rgba(0,0,0,.2)'});
+    document.body.appendChild(t); setTimeout(()=>{ t.remove(); }, 2200);
   }
 
-  document.addEventListener('click', function(ev){
-    var btn = ev.target.closest('.view-all');
-    if (btn){
-      ev.preventDefault();
-      var vid = btn.getAttribute('data-visitor');
-      if (vid) openModalForVisitor(vid);
-      return;
+  function makePageSelect(visitorPages, sitePages, current){
+    const sel = document.createElement('select');
+    sel.className = 'page-filter';
+    const all = document.createElement('option'); all.value=''; all.textContent='كل الصفحات'; sel.appendChild(all);
+    if (visitorPages?.length){
+      const og1=document.createElement('optgroup'); og1.label='صفحات الزائر';
+      visitorPages.forEach(p=>{ const o=document.createElement('option'); o.value=p.key; o.textContent=p.label; og1.appendChild(o); });
+      sel.appendChild(og1);
     }
-    var strip = ev.target.closest('.visitor-strip');
-    if (strip && !ev.target.closest('.view-all') && (ev.target.tagName !== 'SELECT') && !ev.target.closest('form')){
-      openModalForVisitor(strip.getAttribute('data-visitor'));
+    if (sitePages?.length){
+      const og2=document.createElement('optgroup'); og2.label='كل صفحات الموقع';
+      sitePages.forEach(p=>{ const o=document.createElement('option'); o.value=p.key; o.textContent=p.label; og2.appendChild(o); });
+      sel.appendChild(og2);
     }
+    sel.value = current ?? '';
+    return sel;
+  }
+
+  function renderBars(items, sitePages){
+    barsEl.innerHTML = '';
+    if (!items.length){ emptyEl.style.display='block'; barsEl.setAttribute('aria-busy','false'); return; }
+    emptyEl.style.display='none';
+
+    items.forEach(it=>{
+      const wrap = document.createElement('div'); wrap.className='bar';
+
+      const left = document.createElement('div'); left.className='left';
+      left.innerHTML = `
+        <div class="id" title="${esc(it.visitor_id)}">👤 ${esc(it.visitor_id)}</div>
+        <span class="badge" title="عدد الإرسالات">📝 <span class="count">${it.count}</span></span>
+        <span class="status ${statusClass(it.last_status)}" title="آخر حالة">${esc(it.last_status)}</span>
+      `;
+
+      const current = pageSelectionByVisitor.get(it.visitor_id) || '';
+      const sel = makePageSelect(it.visitor_pages, sitePages, current);
+      sel.addEventListener('change', ()=> pageSelectionByVisitor.set(it.visitor_id, sel.value));
+
+      const actions = document.createElement('div'); actions.className='row-actions';
+      actions.innerHTML = `
+        <button class="btn ghost small" data-vid="${esc(it.visitor_id)}">تفاصيل</button>
+        <button class="btn danger small" data-del="${esc(it.visitor_id)}" title="حذف كل تسجيلات هذا الزائر">حذف</button>
+      `;
+      actions.querySelector('button[data-vid]').addEventListener('click', ()=>{
+        const key = pageSelectionByVisitor.get(it.visitor_id) || '';
+        openDetails(it.visitor_id, it.visitor_pages || [], sitePages || [], key);
+      });
+      actions.querySelector('button[data-del]').addEventListener('click', ()=> onDeleteVisitor(it.visitor_id));
+
+      wrap.appendChild(left);
+      wrap.appendChild(sel);
+      wrap.appendChild(actions);
+      barsEl.appendChild(wrap);
+    });
+
+    barsEl.setAttribute('aria-busy','false');
+  }
+
+  async function fetchList(){
+    try{
+      barsEl.setAttribute('aria-busy','true');
+      const url = 'dashboard.php?action=list'+(location.search.includes('vid=')?('&'+location.search.split('?')[1]):'');
+      const res = await fetch(url, {headers:{'Accept':'application/json'}});
+      if(!res.ok) throw new Error('network');
+      const data = await res.json();
+      if(!data.ok) throw new Error('bad');
+
+      if (data.csrf) csrf = data.csrf;
+
+      if (+data.max_id > latestMaxId) { latestMaxId = +data.max_id; liveDot.animate([{opacity:1},{opacity:.2},{opacity:1}],{duration:800}); }
+
+      const saved = new Map(pageSelectionByVisitor);
+      (data.items||[]).forEach(it=>{ if (saved.has(it.visitor_id)) pageSelectionByVisitor.set(it.visitor_id, saved.get(it.visitor_id)); });
+
+      renderBars(data.items||[], data.sitePages||[]);
+    }catch(e){
+      console.error(e); barsEl.setAttribute('aria-busy','false');
+    }
+  }
+
+  function fillModalPageSelect(visitorPages, sitePages, selected){
+    modalPageSel.innerHTML='';
+    const all=document.createElement('option'); all.value=''; all.textContent='كل الصفحات'; modalPageSel.appendChild(all);
+    if (visitorPages?.length){
+      const og1=document.createElement('optgroup'); og1.label='صفحات الزائر';
+      visitorPages.forEach(p=>{ const o=document.createElement('option'); o.value=p.key; o.textContent=p.label; og1.appendChild(o); });
+      modalPageSel.appendChild(og1);
+    }
+    if (sitePages?.length){
+      const og2=document.createElement('optgroup'); og2.label='كل صفحات الموقع';
+      sitePages.forEach(p=>{ const o=document.createElement('option'); o.value=p.key; o.textContent=p.label; og2.appendChild(o); });
+      modalPageSel.appendChild(og2);
+    }
+    modalPageSel.value = selected ?? '';
+  }
+
+  async function openDetails(visitor_id, visitorPages=[], sitePages=[], pageKey=''){
+    modal.classList.add('open'); document.body.style.overflow='hidden';
+    modalTitle.textContent = 'تفاصيل الزائر: ' + visitor_id;
+    fillModalPageSelect(visitorPages, sitePages, pageKey);
+
+    const load = async ()=>{
+      detailsTable.innerHTML = '<tr><th>المصدر</th><th>المعرّف</th><th>الوقت</th><th>الحالة</th><th>الصفحة</th><th>الحقول/الرسالة</th></tr><tr><td colspan="6">جار التحميل...</td></tr>';
+      try{
+        const url = new URL('dashboard.php', location.href);
+        url.searchParams.set('action','details');
+        url.searchParams.set('visitor_id', visitor_id);
+        if (modalPageSel.value) url.searchParams.set('page', modalPageSel.value);
+
+        const res = await fetch(url.toString(), {headers:{'Accept':'application/json'}});
+        const data = await res.json();
+        if(!data.ok) throw new Error('bad');
+
+        if(!data.items || !data.items.length){
+          detailsTable.innerHTML = '<tr><th>المصدر</th><th>المعرّف</th><th>الوقت</th><th>الحالة</th><th>الصفحة</th><th>الحقول/الرسالة</th></tr><tr><td colspan="6" class="empty">لا توجد إدخالات.</td></tr>';
+          return;
+        }
+
+        let html = '<tr><th>المصدر</th><th>المعرّف</th><th>الوقت</th><th>الحالة</th><th>الصفحة</th><th>الحقول/الرسالة</th></tr>';
+        data.items.forEach(row=>{
+          const src = esc(row.source||'');
+          const id = esc(row.id||'');
+          const when = esc(row._created_at||'');
+          const st = esc((row.status||'pending'));
+          const page = esc(row._page_label||'');
+          const fields = row._fields || {};
+          const msg = row._message || '';
+
+          let kv = '';
+          if (fields && Object.keys(fields).length){
+            kv += '<div class="kv">';
+            Object.keys(fields).forEach(k=>{ kv += '<div class="k">'+esc(k)+'</div><div>'+esc(fields[k])+'</div>'; });
+            kv += '</div>';
+          }
+          if (msg && (!fields || !fields.message)) kv += '<div class="small">الرسالة: '+esc(msg)+'</div>';
+
+          let rawPairs = '';
+          if (row.raw){
+            rawPairs += '<div class="raw"><details><summary>عرض كل الأعمدة الخام</summary><pre>';
+            Object.keys(row.raw).forEach(k=>{ rawPairs += esc(k)+': '+esc(row.raw[k])+"\n"; });
+            rawPairs += '</pre></details></div>';
+          }
+
+          html += `<tr>
+            <td>${src}</td>
+            <td>${id}</td>
+            <td>${when || '<span class="small">غير متوفر</span>'}</td>
+            <td><span class="status ${st.toLowerCase()}">${st}</span></td>
+            <td>${page}</td>
+            <td>${kv || '<span class="small">لا توجد حقول</span>'}${rawPairs}</td>
+          </tr>`;
+        });
+
+        detailsTable.innerHTML = html;
+
+      }catch(e){
+        console.error(e);
+        detailsTable.innerHTML = '<tr><th>المصدر</th><th>المعرّف</th><th>الوقت</th><th>الحالة</th><th>الصفحة</th><th>الحقول/الرسالة</th></tr><tr><td colspan="6" class="empty">حدث خطأ أثناء تحميل التفاصيل.</td></tr>';
+      }
+    };
+
+    await load();
+    modalPageSel.onchange = async ()=>{ await load(); };
+  }
+
+  async function onDeleteVisitor(visitor_id){
+    if (!csrf){ await fetchList(); }
+    const ok = confirm('سيتم حذف جميع تسجيلات هذا الزائر من كل المصادر. هل أنت متأكد؟');
+    if (!ok) return;
+    try{
+      const form = new FormData();
+      form.append('csrf', csrf);
+      form.append('visitor_id', visitor_id);
+      const res = await fetch('dashboard.php?action=delete_visitor', {method:'POST', body:form});
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'فشل الحذف');
+      toast('تم حذف تسجيلات الزائر بنجاح');
+      // أغلق التفاصيل إن كانت مفتوحة على هذا الزائر
+      if (modal.classList.contains('open') && modalTitle.textContent.includes(visitor_id)){
+        modal.classList.remove('open'); document.body.style.overflow='';
+      }
+      await fetchList();
+    } catch(e){ console.error(e); alert('فشل الحذف: '+(e.message||e)); }
+  }
+
+  deleteAllBtn.addEventListener('click', async ()=>{
+    if (!csrf){ await fetchList(); }
+    const ok = confirm('تحذير شديد: هذا سيمسح كل الإرسالات من Elementor والاعتمادات وأي جداول submissions. هل تريد المتابعة؟');
+    if (!ok) return;
+    const confirmText = prompt('للتأكيد اكتب YES (أحرف كبيرة):');
+    if (confirmText !== 'YES') return;
+    try{
+      const form = new FormData();
+      form.append('csrf', csrf);
+      form.append('confirm', 'YES');
+      const res = await fetch('dashboard.php?action=delete_all', {method:'POST', body:form});
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'فشل حذف الكل');
+      toast('تم حذف كل الإرسالات');
+      if (modal.classList.contains('open')){ modal.classList.remove('open'); document.body.style.overflow=''; }
+      await fetchList();
+    }catch(e){ console.error(e); alert('فشل حذف الكل: '+(e.message||e)); }
   });
 
-  document.getElementById('closeModal').addEventListener('click', function(){ modal.style.display='none'; });
-  modal.addEventListener('click', function(ev){ if (ev.target === modal) modal.style.display='none'; });
+  modal.addEventListener('click', (ev)=>{ if(ev.target===modal){ modal.classList.remove('open'); document.body.style.overflow=''; }});
+  closeModal.addEventListener('click', ()=>{ modal.classList.remove('open'); document.body.style.overflow=''; });
+
+  manualBtn.addEventListener('click', fetchList);
+  fetchList();
+  setInterval(fetchList, 5000);
+
+  // فتح تلقائي لو وُجد ?vid=...
+  const quick = new URLSearchParams(location.search).get('vid');
+  if (quick) (async()=>{
+    try{
+      const res = await fetch('dashboard.php?action=list&vid='+encodeURIComponent(quick), {headers:{'Accept':'application/json'}});
+      const data = await res.json();
+      csrf = data.csrf || csrf;
+      renderBars(data.items||[], data.sitePages||[]);
+      const t = (data.items||[]).find(x=>x.visitor_id===quick);
+      if (t) openDetails(t.visitor_id, t.visitor_pages, data.sitePages||[], '');
+    }catch(e){ console.error(e); }
+  })();
 })();
 </script>
 </body>
